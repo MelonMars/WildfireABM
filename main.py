@@ -1,14 +1,20 @@
+import time
+
 import numpy as np
 import matplotlib.pyplot as plt
 import vnoise
 import math
+from mesa import Agent, Model
+from mesa.time import RandomActivation
+from mesa.space import ContinuousSpace
+from mesa.datacollection import DataCollector
 
 
 # Setup:
 
 
-class GridPoint:
-    def __init__(self, x, y, veg, moisture, elev, fuel, density, state, length=10):
+class GridPoint(Agent):
+    def __init__(self, unique_id, model, x, y, veg, moisture, elev, fuel, density, state, length=10):
         """
         :param x:
         :param y:
@@ -24,6 +30,7 @@ class GridPoint:
             State 3: Currently burning
             State 4: Burned out
         """
+        super().__init__(unique_id, model)
         self.x = x
         self.y = y
         self.veg = veg
@@ -34,21 +41,22 @@ class GridPoint:
         self.state = state
         self.length = length
         self.propFac = None
+        self.windDir = 0
+        self.windSpeed = 0
+        self.gpGrid = None
 
-    def step(self, gpGrid: np.ndarray, windDir: float, windSpeed):
-        if self.state == 0:
-            self.state = 0
-        elif self.state == 1:
-            self.state = 1
+    def step(self):
+        if self.state == 1:
+            return  # Nothing happens if flammable but not currently burning
         elif self.state == 2:
-            self.state = 3
-            self.spreadFire(gpGrid, windDir, windSpeed)
+            self.state = 3  # Transition from started burning to currently burning
+            self.spreadFire(self.gpGrid, self.windDir, self.windSpeed)
         elif self.state == 3:
             self.state = 4
 
     def spreadFire(self, gpGrid: np.ndarray, windDir: float, windSpeed: float):
         """
-        Spread fire to neighboring cells
+        Spread fire to neighboring cells.
         Vegetation factor is from 1-3, 1 agricultural, 2 shrubs, 3 trees
         Density factor is from 1-3, 1 sparse, 2 medium, 3 dense
         Wind factor:
@@ -61,11 +69,21 @@ class GridPoint:
             thetaS is the slope angle of the path
         :return:
         """
-
+        width, height = gpGrid.shape
         directions_horizontal_vertical = [(0, 1), (0, -1), (1, 0), (-1, 0)]
         directions_diagonal = [(-1, -1), (-1, 1), (1, -1), (1, 1)]
-        neighbors_hor_ver = [gpGrid[self.x + dx, self.y + dy] for dx, dy in directions_horizontal_vertical if 0 <= self.x + dx < width and 0 <= self.y + dy < height]
-        neighbors_dia = [gpGrid[self.x + dx, self.y + dy] for dx, dy in directions_diagonal if 0 <= self.x + dx < width and 0 <= self.y + dy < height]
+
+        neighbors_hor_ver = [
+            gpGrid[self.x + dx, self.y + dy]
+            for dx, dy in directions_horizontal_vertical
+            if 0 <= self.x + dx < width and 0 <= self.y + dy < height
+        ]
+        neighbors_dia = [
+            gpGrid[self.x + dx, self.y + dy]
+            for dx, dy in directions_diagonal
+            if 0 <= self.x + dx < width and 0 <= self.y + dy < height
+        ]
+
         c1 = 0
         c2 = 0
         V = windSpeed
@@ -73,70 +91,107 @@ class GridPoint:
         a = 0
         pH = 0  # Constant factor
         pW = np.exp(np.dot(c1, V)) * np.exp(np.dot(V, np.dot(c2, (math.cos(theta) - 1))))
-        for tile in neighbors_hor_ver:
-            thetaS = math.atan((tile.elev - self.elev) / self.length)
-            pVeg = tile.veg # Vegetation factor
-            pDen = tile.density # Density factor
-            pS = np.exp(np.dot(a,thetaS)) # Slope factor
-            pBurn = pH * (1 + pVeg) * (1 + pDen) * pW * pS
-            if (np.random.randint(0, 1) > pBurn):
-                tile.state = 2
-                # Set tile propFac to the propagation factor from here (i.e. tell the tile the angle the fire came at it from)
 
-        for tile in neighbors_dia:
-            thetaS = math.atan((tile.elev - self.elev) / self.length*math.sqrt(2))
+        for tile in neighbors_hor_ver + neighbors_dia:
+            if tile.state != 1:  # Only spread to flammable cells
+                continue
+            thetaS = math.atan(
+                (tile.elev - self.elev) / (self.length if tile in neighbors_hor_ver else self.length * math.sqrt(2)))
             pVeg = tile.veg  # Vegetation factor
             pDen = tile.density  # Density factor
             pS = np.exp(np.dot(a, thetaS))  # Slope factor
             pBurn = pH * (1 + pVeg) * (1 + pDen) * pW * pS
-            if (np.random.randint(0, 1) > pBurn):
-                tile.state = 2
-                # Set tile propFac to the propagation factor from here (i.e. tell the tile the angle the fire came at it from)
+            if np.random.random() > pBurn:
+                tile.state = 2  # Set the neighbor to start burning
+                tile.propFac = math.degrees(math.atan2(tile.y - self.y, tile.x - self.x))  # Set the propagation factor
 
 
-width, height = 10, 10
-arr = np.ones((width, height))
-noise = vnoise.Noise()
-noise.seed(np.random.randint(0, 10000000))
-for i in range(width):
-    for j in range(height):
-        arr[i, j] = noise.noise2(i * 0.1, j * 0.1, grid_mode=True, lacunarity=0.3, octaves=1, persistence=5)
+class WildfireModel(Model):
+    def __init__(self, width, height, hill_radius, hill_height, moisture, species, wind_dir, wind_speed):
+        super().__init__()
+        self.width = width
+        self.height = height
+        self.hill_radius = hill_radius
+        self.hill_height = hill_height
+        self.moisture = moisture
+        self.species = species
+        self.wind_dir = wind_dir
+        self.wind_speed = wind_speed
+        self.grid = []
+        self.npGrid = np.empty((width, height), dtype=object)
+        self.fire_started = False
 
-arr = (arr - np.min(arr)) / (np.max(arr) - np.min(arr))
-arr = arr * 100 - 50
-arr = arr ** 2
-arr = arr * 0.5 + np.mean(arr) * 0.5
+        # Initialize terrain using vnoise
+        arr = np.ones((width, height))
+        noise = vnoise.Noise()
+        noise.seed(np.random.randint(0, 10000000))
+        for i in range(width):
+            for j in range(height):
+                arr[i, j] = noise.noise2(i * 0.1, j * 0.1, grid_mode=True, lacunarity=0.3, octaves=1, persistence=5)
 
-hill_radius = 300
-hill_height = 700
-center_x, center_y = width // 2, height // 2
-for i in range(width):
-    for j in range(height):
-        dist = np.sqrt((i - center_x) ** 2 + (j - center_y) ** 2)
-        if dist < hill_radius:
-            arr[i, j] += hill_height * (1 - dist / hill_radius)
+        arr = (arr - np.min(arr)) / (np.max(arr) - np.min(arr))
+        arr = arr * 100 - 50
+        arr = arr ** 2
+        arr = arr * 0.5 + np.mean(arr) * 0.5
 
-arr = (arr - np.min(arr)) / (np.max(arr) - np.min(arr))
-arr = arr * 500
-plt.imshow(arr, cmap='terrain', interpolation='nearest')
-plt.colorbar()
-plt.show()
+        for i in range(width):
+            for j in range(height):
+                fuel = np.random.randint(0, 100)
+                density = np.random.randint(5, 20)
+                gp = GridPoint(
+                    unique_id=i * width + j,  # Example unique_id calculation, adjust as needed
+                    model=self,
+                    x=i,
+                    y=j,
+                    veg=self.species,
+                    moisture=self.moisture,
+                    elev=arr[i, j],
+                    fuel=fuel,
+                    density=density,
+                    state=1  # Initial state, adjust as needed
+                )
+                self.grid.append(gp)
+                self.npGrid[i, j] = gp
 
-grid = []
-npGrid = np.zeros((width, height))
-moisture, species = 3, 1
-windDir = 0 # 0 > 360
-windSpeed = 15 # mph
-for i in range(width * height):
-    fuel = np.random.randint(0, 100)
-    density = np.random.randint(5, 20)
-    gp = GridPoint(i % width, i // width, species, moisture, arr[i % width, i // width], fuel, density, 1)
-    grid.append(gp)
-    npGrid[i % width, i // width] = gp
+        # Start fire
+        fireTile = np.random.choice(self.grid)
+        fireTile.state = 2
+        fireTile.propFac = 0
+        self.fire_started = True
+
+        self.schedule = self.create_schedule()
+
+        self.datacollector = DataCollector(
+            agent_reporters={"State": "state"}
+        )
+
+    def create_schedule(self):
+        return RandomActivation(self)
+
+    def step(self):
+        for gp in self.grid:
+            gp.gpGrid = self.npGrid
+            gp.windDir = self.wind_dir
+            gp.windSpeed = self.wind_speed
+            gp.step()
+
+        if self.schedule.steps % 4 == 0:
+            self.visualize_grid()
+
+        self.datacollector.collect(self)
+
+    def visualize_grid(self):
+        plt.imshow(np.array([[instance.state for instance in row] for row in self.npGrid]), cmap='terrain',
+                   interpolation='nearest')
+        plt.colorbar()
+        plt.show()
+        time.sleep(0.1)
 
 
-# Fire starts
+if __name__ == "__main__":
+    model = WildfireModel(width=100, height=100, hill_radius=30, hill_height=700, moisture=3, species=1, wind_dir=0,
+                          wind_speed=15)
+    for i in range(100):
+        model.step()
 
-fire = np.zeros((width, height))
-fireTile = np.random.choice(grid)
-print(fireTile.x, fireTile.y)
+        time.sleep(0.1)
