@@ -1,20 +1,21 @@
-import time
-
 import numpy as np
-import matplotlib.pyplot as plt
 import vnoise
 import math
 from mesa import Agent, Model
 from mesa.time import RandomActivation
-from mesa.space import ContinuousSpace
+from mesa.space import ContinuousSpace, MultiGrid
 from mesa.datacollection import DataCollector
+from mesa.visualization.modules import CanvasGrid
+from mesa.visualization.ModularVisualization import ModularServer
+from mesa.visualization.UserParam import Slider
+from mesa.visualization.modules import ChartModule
 
 
 # Setup:
 
 
 class GridPoint(Agent):
-    def __init__(self, unique_id, model, x, y, veg, moisture, elev, fuel, density, state, length=10):
+    def __init__(self, unique_id, model, x, y, veg, moisture, elev, fuel, density, state, c1, c2, a, pH, length=10):
         """
         :param x:
         :param y:
@@ -44,8 +45,15 @@ class GridPoint(Agent):
         self.windDir = 0
         self.windSpeed = 0
         self.gpGrid = None
+        # Next values are defined in the spreadFire method
+        self.c1 = 0
+        self.c2 = 0
+        self.a = 0
+        self.pH = 0
+        self.pBurn = None
 
     def step(self):
+        self.pBurn = None
         if self.state == 1:
             return  # Nothing happens if flammable but not currently burning
         elif self.state == 2:
@@ -73,41 +81,36 @@ class GridPoint(Agent):
         directions_horizontal_vertical = [(0, 1), (0, -1), (1, 0), (-1, 0)]
         directions_diagonal = [(-1, -1), (-1, 1), (1, -1), (1, 1)]
 
-        neighbors_hor_ver = [
-            gpGrid[self.x + dx, self.y + dy]
-            for dx, dy in directions_horizontal_vertical
-            if 0 <= self.x + dx < width and 0 <= self.y + dy < height
-        ]
-        neighbors_dia = [
-            gpGrid[self.x + dx, self.y + dy]
-            for dx, dy in directions_diagonal
-            if 0 <= self.x + dx < width and 0 <= self.y + dy < height
-        ]
+        neighbors = self.model.grid.get_neighbors((self.x, self.y), moore=True, include_center=False)
 
-        c1 = 0
-        c2 = 0
         V = windSpeed
         theta = self.propFac - windDir
-        a = 0
-        pH = 0  # Constant factor
-        pW = np.exp(np.dot(c1, V)) * np.exp(np.dot(V, np.dot(c2, (math.cos(theta) - 1))))
+        pW = np.exp(self.c1 * V) * np.exp(self.c2 * (math.cos(math.radians(theta)) - 1))
 
-        for tile in neighbors_hor_ver + neighbors_dia:
+        for tile in neighbors:
             if tile.state != 1:  # Only spread to flammable cells
                 continue
-            thetaS = math.atan(
-                (tile.elev - self.elev) / (self.length if tile in neighbors_hor_ver else self.length * math.sqrt(2)))
+
+            dx = tile.x - self.x
+            dy = tile.y - self.y
+            is_diagonal = (dx, dy) in directions_diagonal
+
+            distance = self.length if not is_diagonal else self.length * math.sqrt(2)
+            thetaS = math.atan((tile.elev - self.elev) / distance)
+
             pVeg = tile.veg  # Vegetation factor
             pDen = tile.density  # Density factor
-            pS = np.exp(np.dot(a, thetaS))  # Slope factor
-            pBurn = pH * (1 + pVeg) * (1 + pDen) * pW * pS
-            if np.random.random() > pBurn:
+            pS = np.exp(self.a * thetaS)  # Slope factor
+
+            self.pBurn = self.pH * (1 + pVeg) * (1 + pDen) * pW * pS
+            print(self.pBurn)
+            if np.random.random() < self.pBurn:
                 tile.state = 2  # Set the neighbor to start burning
-                tile.propFac = math.degrees(math.atan2(tile.y - self.y, tile.x - self.x))  # Set the propagation factor
+                tile.propFac = math.degrees(math.atan2(tile.y - self.y, tile.x - self.x))
 
 
 class WildfireModel(Model):
-    def __init__(self, width, height, hill_radius, hill_height, moisture, species, wind_dir, wind_speed):
+    def __init__(self, width, height, hill_radius, hill_height, moisture, species, wind_dir, wind_speed, c1, c2, a, pH):
         super().__init__()
         self.width = width
         self.height = height
@@ -117,10 +120,10 @@ class WildfireModel(Model):
         self.species = species
         self.wind_dir = wind_dir
         self.wind_speed = wind_speed
-        self.grid = []
+        self.grid = MultiGrid(width, height, torus=True)
         self.npGrid = np.empty((width, height), dtype=object)
         self.fire_started = False
-
+        self.schedule = RandomActivation(self)
         # Initialize terrain using vnoise
         arr = np.ones((width, height))
         noise = vnoise.Noise()
@@ -148,50 +151,105 @@ class WildfireModel(Model):
                     elev=arr[i, j],
                     fuel=fuel,
                     density=density,
-                    state=1  # Initial state, adjust as needed
+                    state=1,  # Initial state, adjust as needed
+                    c1=c1,
+                    c2=c2,
+                    a=a,
+                    pH=pH
                 )
-                self.grid.append(gp)
+                self.grid.place_agent(gp, (i, j))
+                self.schedule.add(gp)
                 self.npGrid[i, j] = gp
 
         # Start fire
-        fireTile = np.random.choice(self.grid)
+        fireTile = np.random.choice(self.schedule.agents)
         fireTile.state = 2
         fireTile.propFac = 0
         self.fire_started = True
 
-        self.schedule = self.create_schedule()
-
         self.datacollector = DataCollector(
-            agent_reporters={"State": "state"}
+            agent_reporters={"State": "state",
+                             "PBurn": "pBurn"},
+            model_reporters={"Average_pBurn": self.compute_average_pBurn,
+                             "Burners": self.compute_burners},
         )
 
-    def create_schedule(self):
-        return RandomActivation(self)
+    def compute_average_pBurn(self):
+        agent_pBurns = [agent.pBurn for agent in self.schedule.agents if agent.pBurn is not None]
+        if agent_pBurns:
+            return sum(agent_pBurns) / len(agent_pBurns)
+        else:
+            return 100
+
+    def compute_burners(self):
+        return len([agent for agent in self.schedule.agents if agent.pBurn is not None])
 
     def step(self):
-        for gp in self.grid:
-            gp.gpGrid = self.npGrid
-            gp.windDir = self.wind_dir
-            gp.windSpeed = self.wind_speed
-            gp.step()
-
-        if self.schedule.steps % 4 == 0:
-            self.visualize_grid()
+        # Possibly change wind dir and speed here for more complex simulations
+        for agent in self.schedule.agents:
+            agent.windDir = self.wind_dir
+            agent.windSpeed = self.wind_speed
+            agent.gpGrid = self.npGrid
+            agent.step()
 
         self.datacollector.collect(self)
 
-    def visualize_grid(self):
-        plt.imshow(np.array([[instance.state for instance in row] for row in self.npGrid]), cmap='terrain',
-                   interpolation='nearest')
-        plt.colorbar()
-        plt.show()
-        time.sleep(0.1)
+    def grid(self):
+        portrayal = {}
+        for gp in self.grid:
+            portrayal[gp.unique_id] = {
+                "x": gp.x,
+                "y": gp.y,
+                "Shape": "rect",
+                "w": 1,
+                "h": 1,
+                "Filled": "true",
+                "Color": "red" if gp.state == 2 else "green"
+            }
+        return portrayal
+
+
+def agent_portrayal(agent):
+    if agent.state == 2:
+        color = "red"
+    elif agent.state == 1:
+        color = "green"
+    else:
+        color = "black"
+
+    return {"Shape": "rect", "Color": color, "Filled": "true", "Layer": 0, "w": 1, "h": 1}
+
+
+grid = CanvasGrid(agent_portrayal, 100, 100, 500, 500)
+chart = ChartModule(
+    [
+        {"Label": "Average_pBurn", "Color": "Black"},
+        {"Label": "Burners", "Color": "Red"}
+     ],
+    data_collector_name='datacollector'
+)
 
 
 if __name__ == "__main__":
-    model = WildfireModel(width=100, height=100, hill_radius=30, hill_height=700, moisture=3, species=1, wind_dir=0,
-                          wind_speed=15)
-    for i in range(100):
-        model.step()
 
-        time.sleep(0.1)
+    server = ModularServer(
+        WildfireModel,
+        [grid, chart],
+        "Wildfire Model",
+        {"width": 100,
+            "height": 100,
+            "hill_radius": 30,
+            "hill_height": 700,
+            "moisture": Slider("Moisture", 1, 1, 10),
+            "species": Slider("Species", 1, 1, 3),
+            "wind_dir": Slider("Wind Direction", 0, 0, 360),
+            "wind_speed": Slider("Wind Speed", 15, 0, 30),
+            "c1": Slider("c1", 1, -100, 100),
+            "c2": Slider("c2", 1, -100, 100),
+            "a": Slider("a", 1, -100, 100),
+            "pH": Slider("pH", 1, -100, 100),
+         }
+    )
+
+    server.port = 8521
+    server.launch()
