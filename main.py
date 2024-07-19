@@ -35,7 +35,7 @@ def genPath(grid, start, end, state):
             y1 += sy
 
 class GridPoint(Agent):
-    def __init__(self, unique_id, model, x, y, veg, moisture, elev, density, state, c1, c2, a, pH, length=10):
+    def __init__(self, unique_id, model, x, y, veg, moisture, elev, density, state, c1, c2, a, pH, l, c0, length=10):
         """
         :param x:
         :param y:
@@ -70,6 +70,9 @@ class GridPoint(Agent):
         self.a = a
         self.pH = pH
         self.pBurn = None
+        # Next value(s) are defined in the spotting method
+        self.l = l
+        self.c0 = c0
 
     def step(self):
         self.pBurn = None
@@ -79,6 +82,7 @@ class GridPoint(Agent):
             self.state = 3  # Transition from started burning to currently burning
         elif self.state == 3:
             self.spreadFire(self.gpGrid, self.windDir, self.windSpeed)
+            self.spotting()
             self.state = 4
 
     def spreadFire(self, gpGrid: np.ndarray, windDir: float, windSpeed: float):
@@ -123,9 +127,33 @@ class GridPoint(Agent):
                 tile.state = 2  # Set the neighbor to start burning
                 tile.propFac = math.degrees(math.atan2(tile.y - self.y, tile.x - self.x))
 
+    def spotting(self):
+        """
+        l = lambda, the mean of the poisson distribution that the amount of firebrands is drawn from
+        rn = a "random number drawn from a normal distribution with a given mean and standard deviation" (but yet the
+        paper doesn't define what that mean and deviation are)
+        direction = direction the firebrand goes in
+        """
+        nBrands = np.random.poisson(self.l)
+        for i in range(nBrands):
+            rn = np.random.normal(self.windDir, 10)
+            direction = np.random.randint(0, 360)
+            distance = rn * np.exp(np.dot(self.windSpeed, self.c2*(math.cos(math.degrees(math.atan2(self.windDir, direction)))-1)))
+            tX = self.x + distance * math.cos(math.radians(direction))
+            tY = self.y + distance * math.sin(math.radians(direction))
+            tileX = round(tX)
+            tileY = round(tY)
+            tileX = max(0, min(tileX, self.gpGrid.shape[0] - 1))
+            tileY = max(0, min(tileY, self.gpGrid.shape[1] - 1))
+            tile = self.gpGrid[tileX, tileY]
+            if tile.state == 1 and np.random.random() < self.c0 * (tile.veg * tile.density + 1):
+                tile.state = 2
+                tile.propFac = 0
+
 
 class WildfireModel(Model):
-    def __init__(self, width, height, hill_radius, hill_height, moisture, species, wind_dir, wind_speed, c1, c2, a, pH):
+    def __init__(self, width, height, hill_radius, hill_height, moisture, species, wind_dir, wind_speed, c1, c2, a, pH,
+                 l, c0):
         super().__init__()
         self.width = width
         self.height = height
@@ -167,7 +195,9 @@ class WildfireModel(Model):
                     c1=c1,
                     c2=c2,
                     a=a,
-                    pH=pH
+                    pH=pH,
+                    l=l,
+                    c0=c0
                 )
                 self.grid.place_agent(gp, (i, j))
                 self.schedule.add(gp)
@@ -295,6 +325,8 @@ if __name__ == "__main__":
             "c2": Slider("c2", 0.131, 0, 1, step=0.001),
             "a": Slider("a", 0.078, 0, 1, step=0.001),
             "pH": Slider("pH", 0.58, 0, 1, step=0.001),
+            "l": Slider("l", 2, 0, 100, step=1),
+            "c0": Slider("c0", 0.07, 0, 5, step=0.001),
          }
     )
 
