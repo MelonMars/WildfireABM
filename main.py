@@ -11,11 +11,31 @@ from mesa.visualization.UserParam import Slider
 from mesa.visualization.modules import ChartModule
 
 
-# Setup:
+def genPath(grid, start, end, state):
+    x1, y1 = start
+    x2, y2 = end
 
+    dx = abs(x2 - x1)
+    dy = abs(y2 - y1)
+    sx = 1 if x1 < x2 else -1
+    sy = 1 if y1 < y2 else -1
+    err = dx - dy
+
+    while True:
+        if 0 <= x1 < grid.shape[0] and 0 <= y1 < grid.shape[1]:
+            grid[x1, y1].state = state
+        if x1 == x2 and y1 == y2:
+            break
+        e2 = err * 2
+        if e2 > -dy:
+            err -= dy
+            x1 += sx
+        if e2 < dx:
+            err += dx
+            y1 += sy
 
 class GridPoint(Agent):
-    def __init__(self, unique_id, model, x, y, veg, moisture, elev, fuel, density, state, c1, c2, a, pH, length=10):
+    def __init__(self, unique_id, model, x, y, veg, moisture, elev, density, state, c1, c2, a, pH, length=10):
         """
         :param x:
         :param y:
@@ -37,7 +57,6 @@ class GridPoint(Agent):
         self.veg = veg
         self.moisture = moisture
         self.elev = elev
-        self.fuel = fuel
         self.density = density
         self.state = state
         self.length = length
@@ -46,10 +65,10 @@ class GridPoint(Agent):
         self.windSpeed = 0
         self.gpGrid = None
         # Next values are defined in the spreadFire method
-        self.c1 = 0
-        self.c2 = 0
-        self.a = 0
-        self.pH = 0
+        self.c1 = c1
+        self.c2 = c2
+        self.a = a
+        self.pH = pH
         self.pBurn = None
 
     def step(self):
@@ -58,8 +77,8 @@ class GridPoint(Agent):
             return  # Nothing happens if flammable but not currently burning
         elif self.state == 2:
             self.state = 3  # Transition from started burning to currently burning
-            self.spreadFire(self.gpGrid, self.windDir, self.windSpeed)
         elif self.state == 3:
+            self.spreadFire(self.gpGrid, self.windDir, self.windSpeed)
             self.state = 4
 
     def spreadFire(self, gpGrid: np.ndarray, windDir: float, windSpeed: float):
@@ -77,8 +96,6 @@ class GridPoint(Agent):
             thetaS is the slope angle of the path
         :return:
         """
-        width, height = gpGrid.shape
-        directions_horizontal_vertical = [(0, 1), (0, -1), (1, 0), (-1, 0)]
         directions_diagonal = [(-1, -1), (-1, 1), (1, -1), (1, 1)]
 
         neighbors = self.model.grid.get_neighbors((self.x, self.y), moore=True, include_center=False)
@@ -88,7 +105,7 @@ class GridPoint(Agent):
         pW = np.exp(self.c1 * V) * np.exp(self.c2 * (math.cos(math.radians(theta)) - 1))
 
         for tile in neighbors:
-            if tile.state != 1:  # Only spread to flammable cells
+            if tile.state != 1:
                 continue
 
             dx = tile.x - self.x
@@ -101,9 +118,7 @@ class GridPoint(Agent):
             pVeg = tile.veg  # Vegetation factor
             pDen = tile.density  # Density factor
             pS = np.exp(self.a * thetaS)  # Slope factor
-
             self.pBurn = self.pH * (1 + pVeg) * (1 + pDen) * pW * pS
-            print(self.pBurn)
             if np.random.random() < self.pBurn:
                 tile.state = 2  # Set the neighbor to start burning
                 tile.propFac = math.degrees(math.atan2(tile.y - self.y, tile.x - self.x))
@@ -120,7 +135,7 @@ class WildfireModel(Model):
         self.species = species
         self.wind_dir = wind_dir
         self.wind_speed = wind_speed
-        self.grid = MultiGrid(width, height, torus=True)
+        self.grid = MultiGrid(width, height, torus=False)
         self.npGrid = np.empty((width, height), dtype=object)
         self.fire_started = False
         self.schedule = RandomActivation(self)
@@ -139,18 +154,15 @@ class WildfireModel(Model):
 
         for i in range(width):
             for j in range(height):
-                fuel = np.random.randint(0, 100)
-                density = np.random.randint(5, 20)
                 gp = GridPoint(
                     unique_id=i * width + j,  # Example unique_id calculation, adjust as needed
                     model=self,
                     x=i,
                     y=j,
-                    veg=self.species,
+                    veg=vegConv[np.random.choice(rList)],
                     moisture=self.moisture,
                     elev=arr[i, j],
-                    fuel=fuel,
-                    density=density,
+                    density=densityConv[np.random.choice(rList)],
                     state=1,  # Initial state, adjust as needed
                     c1=c1,
                     c2=c2,
@@ -160,7 +172,8 @@ class WildfireModel(Model):
                 self.grid.place_agent(gp, (i, j))
                 self.schedule.add(gp)
                 self.npGrid[i, j] = gp
-
+        genPath(self.npGrid, [0, 0], [width - 1, height - 1], 0)
+        genPath(self.npGrid, [0, height - 1], [width - 1, 0], 0)
         # Start fire
         fireTile = np.random.choice(self.schedule.agents)
         fireTile.state = 2
@@ -179,7 +192,7 @@ class WildfireModel(Model):
         if agent_pBurns:
             return sum(agent_pBurns) / len(agent_pBurns)
         else:
-            return 100
+            return 0
 
     def compute_burners(self):
         return len([agent for agent in self.schedule.agents if agent.pBurn is not None])
@@ -210,14 +223,32 @@ class WildfireModel(Model):
 
 
 def agent_portrayal(agent):
-    if agent.state == 2:
-        color = "red"
+    if agent.state == 0:
+        color = "grey"
+    elif agent.state == 2:
+        color = "yellow"
     elif agent.state == 1:
         color = "green"
-    else:
+    elif agent.state == 3:
+        color = "red"
+    elif agent.state == 4:
         color = "black"
+    else:
+        color = "blue"
 
     return {"Shape": "rect", "Color": color, "Filled": "true", "Layer": 0, "w": 1, "h": 1}
+
+
+def alt_portrayal(agent):
+    # Set color based on elev of agent
+    if agent.elev < 0:
+        color = "blue"
+    elif agent.elev < 50:
+        color = "green"
+    elif agent.elev < 100:
+        color = "yellow"
+    else:
+        color = "red"
 
 
 grid = CanvasGrid(agent_portrayal, 100, 100, 500, 500)
@@ -229,6 +260,22 @@ chart = ChartModule(
     data_collector_name='datacollector'
 )
 
+densityConv = {
+    1: -0.4,
+    2: 0,
+    3: 0.3
+}
+
+vegConv = {
+    1: -0.3,
+    2: 0,
+    3: 0.4
+}
+
+rList = [1, 2, 3]
+
+
+altGrid = CanvasGrid(agent_portrayal, 100, 100, 500, 500)
 
 if __name__ == "__main__":
 
@@ -244,10 +291,10 @@ if __name__ == "__main__":
             "species": Slider("Species", 1, 1, 3),
             "wind_dir": Slider("Wind Direction", 0, 0, 360),
             "wind_speed": Slider("Wind Speed", 15, 0, 30),
-            "c1": Slider("c1", 1, -100, 100),
-            "c2": Slider("c2", 1, -100, 100),
-            "a": Slider("a", 1, -100, 100),
-            "pH": Slider("pH", 1, -100, 100),
+            "c1": Slider("c1", 0.045, 0, 1, step=0.001),
+            "c2": Slider("c2", 0.131, 0, 1, step=0.001),
+            "a": Slider("a", 0.078, 0, 1, step=0.001),
+            "pH": Slider("pH", 0.58, 0, 1, step=0.001),
          }
     )
 
